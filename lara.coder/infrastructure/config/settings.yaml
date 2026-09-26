@@ -1,0 +1,22 @@
+# Root runtime configuration. Secrets (API keys) should come from
+# environment variables, never committed here — this file holds
+# non-secret defaults only.
+
+model:
+  default_provider: anthropic
+  default_model: claude-sonnet-4-6
+
+limits:
+  max_build_iterations: 10
+  max_fix_attempts_per_error: 3
+  max_total_fix_attempts: 15
+  max_improve_iterations: 5
+  per_step_timeout_seconds: 120
+  total_run_timeout_seconds: 3600
+
+stack:
+  default: nextjs-typescript-tailwind
+
+sandbox:
+  workdir: /workspace
+  network_isolated: true

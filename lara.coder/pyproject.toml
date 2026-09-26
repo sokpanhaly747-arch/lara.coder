@@ -1,0 +1,25 @@
+[project]
+name = "lara.coder"
+version = "0.1.0"
+description = "AI agent system that turns a product idea into a working, tested software product"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "jsonschema>=4.22",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "playwright>=1.45",
+]
+
+[project.optional-dependencies]
+training = ["transformers>=4.43", "peft>=0.12", "trl>=0.9", "bitsandbytes>=0.43", "torch>=2.3"]
+dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "ruff>=0.5"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

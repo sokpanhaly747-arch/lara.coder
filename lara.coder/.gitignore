@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.laracoder_memory/
+checkpoints/
+.env
+*.egg-info/
+dist/
+build/
+.DS_Store

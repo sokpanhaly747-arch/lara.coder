@@ -1,0 +1,1734 @@
+[
+  {
+    "title": "Phantom Double-Fill in a Low-Latency Matching Engine",
+    "domain": "Distributed HFT / Low-Latency C++/Python Systems",
+    "difficulty": "research-grade-adversarial",
+    "incident": "Production matching engine occasionally fills the same client order twice under high market-data throughput (~1 per 2M events). Never reproduces in staging or in the CI stress suite. Initial suspicion falls on the Python strategy layer resubmitting orders, since most incidents show a 'duplicate order_id rejected' log line -- but a minority show two unrejected FILL acks instead.",
+    "constraints": [
+      "p99 order-to-ack latency budget: 3 microseconds end-to-end",
+      "OrderEvent struct ABI must remain binary-compatible with compiled v2 strategy plugins",
+      "No blocking locks permitted on the market-data hot path",
+      "Public Python strategy callback API (on_fill, on_reject) must not change"
+    ],
+    "success_criteria": [
+      "No order is ever filled twice for the same order_id under stress testing",
+      "p99 latency remains <= 3 microseconds under the 10M-event benchmark",
+      "Existing ring_buffer_correctness_test and full existing suite continue to pass",
+      "New NUMA cross-socket regression test passes reliably across 500 runs"
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an autonomous SWE agent on the 'hft-engine' repository (C++ matching core, pybind11 Python strategy layer). Tools: read_file, edit_file, write_file, run_command, submit_patch. Investigate the incident, establish root cause with evidence, apply a minimal correct patch, and verify all constraints before calling submit_patch()."
+      },
+      {
+        "role": "user",
+        "content": "INC-4471: over the past 3 months our matching engine has filled 14 client orders twice. All occurrences happened during high-throughput bursts (>500k market-data events/sec). Does not reproduce in staging or in CI. Trading desk suspects the Python strategy layer is resubmitting orders. p99 order-to-ack latency budget is 3 microseconds and must not regress. The OrderEvent struct is ABI-locked for existing v2 strategy plugins. Investigate and fix."
+      },
+      {
+        "role": "assistant",
+        "content": "OBSERVATION: start from the incident record before touching code. NEXT ACTION: read the incident log.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "incidents/INC-4471.md"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "INC-4471.md: 14 double-fill events over 90 days, all during bursts >500k msg/s.\n11 events: log line 'duplicate order_id 774213: rejected by dedup_guard' (dedup appears to work).\n3 events: log lines 'FILL ack sent' x2 for order_id 552091, 88213741, 33410982 — NO rejection logged for these."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS 1 (plausible): Python strategy layer double-submits due to an order_id generation race, and dedup_guard usually but not always catches it. EVIDENCE NEEDED: check thread-safety of id generation.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "python/strategy/order_id_gen.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "class OrderIdGen:\n    def __init__(self): self._lock = threading.Lock(); self._counter = 0\n    def next(self):\n        with self._lock:\n            self._counter += 1\n            return f'{self.session_id}-{self._counter}'\nCounter increment is lock-protected; ids should be unique per session."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "EVIDENCE/CONFLICT: id generator is correctly serialized, so client-side collision is unlikely. The 3 unrejected double-fills are the anomaly — no reject line means dedup_guard's check never fired as a rejection. DECISION: inspect dedup_guard directly.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "cpp/execution/dedup_guard.cpp"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "bool DedupGuard::check(uint64_t order_id) {\n    if (seen_.count(order_id)) { log_reject(order_id); return false; }\n    seen_.insert(order_id); return true;\n}\n// Runs only on execution thread; no internal locking needed."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "CONTRADICTION: if dedup_guard checks every fill on a single thread, a real duplicate submission should always produce one FILL + one REJECT line — never two FILL lines with nothing rejected. That means the execution thread received two *different-looking* legitimate order records from upstream, not a resubmission. HYPOTHESIS 2: something upstream is handing execution corrupted/duplicated data. Before going further, check whether an existing test already covers this path.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "cpp/tests/ring_buffer_correctness_test.cpp"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "Test spawns one producer + one consumer thread, both pinned to the SAME core by the harness default. Pushes 1M synthetic events with a small fixed delay between pushes, asserts no corruption. No cross-core, no NUMA variation."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Run it to establish current status before changing anything.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "ctest -R ring_buffer_correctness_test --output-on-failure"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "Test project /build\n    Start 1: ring_buffer_correctness_test\n1/1 Test #1: ring_buffer_correctness_test ... Passed  4.02 sec\n100% tests passed, 0 tests failed out of 1"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "This test passes reliably, but it never exercises cross-core timing (same-core pinning, fixed delay). A passing test here doesn't rule out a cross-core visibility bug. Also check what differs between the CI/debug build and the production/release build, since that gap will matter for interpreting later experiments.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "CMakeLists.txt"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "target 'engine_debug': flags '-O0 -g -fsanitize=thread -DDEBUG'\ntarget 'engine_release': flags '-O3 -DNDEBUG' (no sanitizers)\nCI runs engine_debug (TSan-instrumented); production runs engine_release."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "NEXT ACTION: inspect the ring buffer that carries market-data events from the feed thread to the execution thread.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "cpp/core/spsc_ring_buffer.hpp"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "void push(const Order& o) {\n    buffer_[write_idx_ % CAPACITY] = o;\n    write_idx_.store(write_idx_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);\n}\nbool pop(Order& out) {\n    if (read_idx_ == write_idx_.load(std::memory_order_relaxed)) return false;\n    out = buffer_[read_idx_ % CAPACITY]; ++read_idx_; return true;\n}\n// relaxed is fine here -- single producer, single consumer, no synchronization needed."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS 2 refined: both index operations use memory_order_relaxed. On real multi-core hardware the consumer can observe the incremented write_idx_ before the corresponding buffer_[] write is visible on its own core -- a torn read of a not-yet-published slot. CONFIDENCE: medium-high, but this alone would usually read as garbage, not as a plausible *different* order. NEXT ACTION: check what a reused slot actually contains before being overwritten.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "cpp/core/order_pool.cpp"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "struct OrderSlot { uint64_t order_id; double price; uint32_t qty; bool filled; };\nvoid OrderPool::release(OrderSlot* s) { s->qty = 0; freelist_.push(s); }\nOrderSlot* OrderPool::acquire() { auto* s = freelist_.pop(); return s; }\n// acquire() does not clear 'filled'; caller is expected to overwrite all fields."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "EVIDENCE CONVERGES: a torn read can surface a slot whose order_id field has already been overwritten with the new order but whose 'filled' field still holds the PREVIOUS occupant's stale 'true' -- read as 'this brand-new order_id is already filled', which the execution path treats as a second legitimate FILL. dedup_guard never sees a rejection because it only tracks order_id membership, not a filled-state race. HYPOTHESIS 3 (environmental): this requires cross-core reordering visibility, which is far more likely across NUMA sockets than within one. Check thread placement in prod vs staging.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "grep -rn 'sched_setaffinity\\|numa_node' cpp/ deploy/ config/"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "deploy/prod.yaml:12:  market_data_thread: {numa_node: 0}\ndeploy/prod.yaml:13:  execution_thread:   {numa_node: 1}\nconfig/staging.yaml:9:   market_data_thread: {numa_node: 0}\nconfig/staging.yaml:10:  execution_thread:   {numa_node: 0}"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Confirmed environmental delta: prod pins the two threads on different NUMA sockets; staging does not. Before concluding, rule out that the GIL somehow serializes this via the Python/native boundary.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "cpp/bindings/market_data_binding.cpp"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "void on_market_data(py::object evt) {\n    py::gil_scoped_release release;\n    ring_buffer.push(translate(evt));\n}\n// GIL is explicitly released before push() -- the push genuinely runs concurrently with Python-side strategy code, not serialized by the interpreter lock."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Ruled out: GIL is not a factor; push() runs under true hardware concurrency. Attempt reproduction under the existing CI harness before building a new one.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "./build_debug/stress_test --duration=60s --log-level=trace 2>&1 | tail -40"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "[stress_test] 60.0s elapsed, 38,412,003 events processed, 0 duplicate fills detected, 0 TSan reports."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "FAILED EXPERIMENT (informative, not disqualifying): a clean TSan run is often read as 'no race exists', but TSan's model flags unsynchronized non-atomic access -- it does not by itself flag a visibility/ordering defect between two atomics that are each individually race-free. The debug build's instrumentation overhead also serializes execution enough to close the narrow reordering window. This result does not disprove the hypothesis. NEXT ACTION: reproduce on the release build with real NUMA cross-socket pinning and minimal instrumentation.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "./build_release/numa_stress_repro --producer-node=0 --consumer-node=1 --duration=45s"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "[numa_stress_repro] t=27.8s: ASSERT FAILED: duplicate FILL for order_id=88213741 (2 fills, 0 rejects logged). Harness halted on first detected duplicate."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "CAUSAL SUMMARY. SYMPTOM: client sees duplicate fills, initially resembling a trading-logic bug. TRIGGER: high-throughput burst under real cross-NUMA thread placement. PRIMARY ROOT CAUSE: spsc_ring_buffer.hpp uses memory_order_relaxed for both the write-index publish and the read-index consume, letting the consumer observe an updated index before the corresponding slot write is visible. SECONDARY ROOT CAUSE: order_pool.cpp does not clear OrderSlot.filled on reuse, so a torn read surfaces a stale 'filled=true' attached to a fresh order_id. CONTRIBUTING FACTOR: cross-socket thread placement in production widens the visibility window versus same-node staging/CI. DOWNSTREAM CONSEQUENCE: execution logic treats the torn read as a second legitimate fill; dedup_guard never rejects because it only tracks order_id membership. RULED OUT: Python id generation (correctly locked), dedup_guard logic (correct given its inputs), GIL interaction (explicitly released, not a factor). PATCH PLAN: (1) fix ring buffer publish/consume ordering, (2) clear filled on pool acquire, (3) add a NUMA-aware regression test."
+      },
+      {
+        "role": "assistant",
+        "content": "PATCH 1: apply the most conservative correct fix first to validate the causal theory -- full sequential consistency on both index operations.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "cpp/core/spsc_ring_buffer.hpp",
+            "old_string": "write_idx_.store(write_idx_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);",
+            "new_string": "write_idx_.store(write_idx_.load(std::memory_order_seq_cst) + 1, std::memory_order_seq_cst);"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to cpp/core/spsc_ring_buffer.hpp (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Also make the consumer's load seq_cst for a consistent fence pair, then verify correctness AND the latency budget, since fencing has a known hot-path cost.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "cpp/core/spsc_ring_buffer.hpp",
+            "old_string": "if (read_idx_ == write_idx_.load(std::memory_order_relaxed)) return false;",
+            "new_string": "if (read_idx_ == write_idx_.load(std::memory_order_seq_cst)) return false;"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to cpp/core/spsc_ring_buffer.hpp (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Re-run the NUMA repro at higher duration and re-check the latency budget.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "./build_release/numa_stress_repro --producer-node=0 --consumer-node=1 --duration=120s && ./build_release/latency_benchmark --events=10000000"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "[numa_stress_repro] 120.0s elapsed, ~103M events, 0 duplicate fills.\n[latency_benchmark] p50=1.1us p99=6.8us (baseline p99 on file was 2.4us) -- BUDGET VIOLATION: 3us p99 exceeded."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "REGRESSION found: correctness fixed, but latency budget broken. Diagnose the cause before choosing a fix rather than guessing.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "perf stat -e cache-misses,cache-references,cycles ./build_release/latency_benchmark --events=1000000"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "cache-misses: up ~4.3x vs the pre-patch baseline in INC-4471 notes. seq_cst on every push/pop forces a full memory barrier and cross-core cache synchronization on every single event, not only when actually needed for correctness."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "RECOVERY: seq_cst is stronger than necessary for a single-producer/single-consumer queue. A release-store on publish paired with an acquire-load on consume establishes the same happens-before relationship without a full fence on every call.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "cpp/core/spsc_ring_buffer.hpp",
+            "old_string": "write_idx_.store(write_idx_.load(std::memory_order_seq_cst) + 1, std::memory_order_seq_cst);",
+            "new_string": "write_idx_.store(write_idx_.load(std::memory_order_relaxed) + 1, std::memory_order_release);"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to cpp/core/spsc_ring_buffer.hpp (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Pair it with an acquire-load on the consumer side.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "cpp/core/spsc_ring_buffer.hpp",
+            "old_string": "if (read_idx_ == write_idx_.load(std::memory_order_seq_cst)) return false;",
+            "new_string": "if (read_idx_ == write_idx_.load(std::memory_order_acquire)) return false;"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to cpp/core/spsc_ring_buffer.hpp (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Fix the secondary root cause directly rather than relying solely on ordering to mask it -- clear the filled flag on acquire, a one-line, minimal-surface change.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "cpp/core/order_pool.cpp",
+            "old_string": "OrderSlot* OrderPool::acquire() { auto* s = freelist_.pop(); return s; }",
+            "new_string": "OrderSlot* OrderPool::acquire() { auto* s = freelist_.pop(); s->filled = false; return s; }"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to cpp/core/order_pool.cpp (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Add a regression test that pins producer/consumer across NUMA nodes so the nightly stress lane catches any reintroduction of this class of bug.",
+        "tool_call": {
+          "name": "write_file",
+          "arguments": {
+            "filepath": "tests/regression/test_numa_duplicate_fill.cpp",
+            "content": "// Pins producer to numa node 0, consumer to node 1; runs 500 iterations of a burst workload; asserts zero duplicate fills and zero unexplained rejects. Fails loudly if run on a single-node machine (skips with a clear message) so it cannot silently pass without exercising cross-socket visibility."
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "write_file",
+          "output": "Created tests/regression/test_numa_duplicate_fill.cpp (62 lines)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "VERIFICATION GATE: extended correctness stress, latency benchmark, full existing suite, and ABI compatibility against compiled v2 strategy plugins.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "./build_release/numa_stress_repro --runs=500 && ./build_release/latency_benchmark --events=10000000 && ctest --output-on-failure && ./build_release/abi_compat_check plugins/v2/*.so"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "numa_stress_repro: 500/500 runs, 0 duplicate fills.\nlatency_benchmark: p50=1.0us p99=2.6us (within 3us budget).\nctest: 143/143 passed, including new test_numa_duplicate_fill and the previously-passing ring_buffer_correctness_test (still passes, now for the right reasons).\nabi_compat_check: OrderEvent sizeof=64, offsets unchanged; all 6 v2 plugins loaded and ran without error."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Confirm no unrelated files were touched.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "git diff --stat"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": " cpp/core/spsc_ring_buffer.hpp              | 4 ++--\n cpp/core/order_pool.cpp                    | 1 +\n tests/regression/test_numa_duplicate_fill.cpp | 62 ++++++++++++++++++++\n 3 files changed, 65 insertions(+), 2 deletions(-)"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "All verification gates pass: the causal chain (ring-buffer ordering + stale pool flag, amplified by NUMA placement) is fully evidenced; competing hypotheses (Python id race, dedup_guard logic, GIL interaction) were eliminated with direct evidence, not assumption; the seq_cst regression introduced by patch 1 was diagnosed and resolved by patch 2 without reintroducing the correctness bug; latency, correctness, ABI, and existing-test invariants all hold; patch surface is minimal and no unrelated files were touched. Submitting.",
+        "tool_call": {
+          "name": "submit_patch",
+          "arguments": {}
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "submit_patch",
+          "output": "Patch submitted. 3 files changed. All gate checks recorded as passed."
+        }
+      }
+    ],
+    "evaluation": {
+      "diagnostic_accuracy": "Correctly identified both the memory-ordering defect and the stale-flag pool reuse as jointly necessary causes, and correctly attributed production-only occurrence to NUMA thread placement rather than treating it as unexplained noise.",
+      "hypothesis_management": "Maintained three concurrent hypotheses (client id race, upstream data corruption, NUMA-amplified reordering), eliminated the id-race and GIL hypotheses with direct evidence rather than assumption, and did not anchor on the first plausible explanation.",
+      "evidence_usage": "Correctly discounted a clean TSan/debug run as non-disqualifying rather than treating it as proof of absence, and used a targeted release/NUMA-pinned reproduction instead of broad unfocused stress runs.",
+      "tool_efficiency": "Every read/run call narrowed the hypothesis space or produced disqualifying/confirming evidence; no redundant or unmotivated calls.",
+      "patch_quality": "Final patch is two lines of memory-ordering change plus a one-line pool fix; no unrelated refactoring, no architecture changes.",
+      "regression_handling": "Detected the seq_cst latency regression via benchmark, diagnosed its mechanism with perf before selecting a fix, and resolved it without reintroducing the original correctness bug.",
+      "performance_awareness": "Explicitly benchmarked against the stated 3us budget both before and after each patch iteration rather than assuming correctness implied acceptable performance.",
+      "compatibility_awareness": "Ran an explicit ABI compatibility check against existing compiled plugins before submission.",
+      "verification_quality": "Ran an extended 500-run stress battery, a full existing test suite, a latency benchmark, and an ABI check, plus confirmed no unrelated files changed.",
+      "recovery_capability": "Cleanly recovered from the self-introduced latency regression using evidence-driven diagnosis rather than reverting blindly or guessing at alternative fences.",
+      "overall_research_difficulty": "High: requires distinguishing a genuine hardware memory-ordering defect from misleading sanitizer and same-core test results, and requires correctly reasoning about two interacting causes rather than stopping at the first sufficient-looking explanation."
+    },
+    "id": "hft-001"
+  },
+  {
+    "title": "Progressive A/V Drift in a Multi-GPU Dubbing Pipeline",
+    "domain": "Distributed AI Video Dubbing / Multi-GPU + FFmpeg + Async Workers",
+    "difficulty": "research-grade-adversarial",
+    "incident": "Long-form dubbed titles occasionally drift out of sync, worsening toward the end of the file, on ~1 in 40 jobs on the 8-GPU production cluster but never on the 2-GPU dev box. FFmpeg logs a 'Non-monotonous DTS' warning on affected jobs, initially pointing at the mux/timestamp step itself; all affected titles are variable-frame-rate broadcast captures.",
+    "constraints": [
+      "Throughput SLA: a 60-minute video must finish in under 10 minutes wall clock on an 8-GPU node",
+      "Segment manifest schema consumed by downstream QC/CDN ingestion must remain schema-v3 compatible",
+      "GPU worker dispatch must remain asynchronous (no global synchronization barrier across the whole batch)",
+      "Fix must handle true variable frame rate sources, not just nominal/constant fps"
+    ],
+    "success_criteria": [
+      "Reassembled audio segments are ordered by original sequence_id with zero reorders under straggler stress",
+      "60-minute video completes in under 10 minutes wall clock on an 8-GPU node",
+      "No audio segment is dropped or truncated at any boundary",
+      "Final audio duration matches video duration within one frame on VFR sources",
+      "Existing test suite and manifest schema validation continue to pass"
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an autonomous SWE agent on the 'auto-dub' repository (multi-GPU TTS dubbing pipeline: PyTorch inference workers, FFmpeg mux/encode, asynchronous cross-process orchestration). Tools: read_file, edit_file, write_file, run_command, submit_patch. Investigate the incident, establish root cause with evidence, patch minimally, and verify before calling submit_patch()."
+      },
+      {
+        "role": "user",
+        "content": "TICKET DUB-2290: long-form dubbed titles occasionally drift out of audio/video sync, worsening toward the end of the file. FFmpeg logs show 'Non-monotonous DTS' warnings on affected jobs. Happens on ~1 in 40 jobs on the 8-GPU production cluster, never on the 2-GPU dev box. All affected titles are broadcast-capture sources (mixed 23.976/24fps, variable frame rate). Throughput SLA: a 60-minute video must finish in under 10 minutes wall clock on an 8-GPU node. The segment manifest schema (consumed by downstream QC/CDN ingestion) must stay schema-v3 compatible. Investigate and fix."
+      },
+      {
+        "role": "assistant",
+        "content": "OBSERVATION: start with the ticket and the FFmpeg warning, since that's the most visible symptom.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "incidents/DUB-2290.md"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "DUB-2290.md: 6 affected jobs this month, all VFR broadcast captures on the 8-GPU cluster. FFmpeg stderr excerpt: '[mp4 @ 0x...] Non-monotonous DTS in output stream 0:1; previous: 481920, current: 468480'. Grafana panel 'gpu_utilization (5m avg)' shows all 8 GPUs evenly loaded throughout affected jobs."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS 1 (plausible): the FFmpeg mux step is misconfigured for VFR sources, producing non-monotonic timestamps directly. Inspect the mux invocation.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "pipeline/mux.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "mux.py builds: ffmpeg -i video.mp4 -i dubbed_audio.wav -map 0:v -map 1:a -c:v copy -c:a aac -shortest out.mp4\nStandard invocation, nothing unusual for VFR passthrough on the video stream."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Test the mux step in isolation with a known-good, correctly-ordered audio track to see if the warning is caused by the mux command itself or by its input.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python pipeline/mux.py --video vfr_sample.mp4 --audio known_good_ordered.wav --out /tmp/isolated_test.mp4"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "Isolated remux completed cleanly. No 'Non-monotonous DTS' warning. Output plays in sync end to end. CONCLUSION: the mux command is not the defect; the warning is a downstream symptom of malformed input audio ordering."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Pivot to the audio segment reassembly stage that produces dubbed_audio.wav from per-GPU-worker TTS output segments.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "audio_pipeline/reassemble.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "def reassemble(results):\n    results.sort(key=lambda r: r.completion_timestamp)\n    return concat_audio([r.audio for r in results])\n# results is populated by worker callbacks as each GPU finishes its segment."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS 2: segments are ordered by completion time, not by their original position in the source (sequence id). Under asynchronous multi-GPU dispatch, a slower ('straggler') worker finishing late would cause its segment to be concatenated out of order. Check the dispatch code for an ordering guarantee.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "pipeline/gpu_worker_pool.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "class GpuWorkerPool:\n    def dispatch(self, segments):\n        for i, seg in enumerate(segments):\n            self.workers[i % self.n_gpus].submit_async(seg)  # round-robin, no completion ordering guarantee\nSegments carry a `sequence_id` field that reassemble.py currently ignores."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Check how completed segments actually travel from each GPU worker process back to the orchestrator, since this is a cross-process boundary and could itself drop or delay results.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "pipeline/ipc_results_queue.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "class ResultsQueue:\n    def __init__(self, maxsize=4): self.q = multiprocessing.Queue(maxsize=maxsize)\n    def put(self, result): self.q.put(result, block=True)  # backpressure: blocks producer if queue is full\n# maxsize=4 means a fast worker can be blocked waiting for a slow consumer, but no results are ever silently dropped -- confirms 'missing segments' is not the mechanism; ordering, not loss, is the defect."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Good -- rules out silent packet loss as a contributor; the queue backpressures rather than drops. Ordering remains the live hypothesis. Before concluding, check whether the existing local test suite already covers reassembly ordering.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "pytest tests/test_dub_pipeline.py -k sync -v"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "tests/test_dub_pipeline.py::test_sync_2gpu_cfr PASSED\n(fixture: 30fps constant-frame-rate sample, 2 simulated GPU workers, near-identical completion timing)"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "This test passes because its fixture (CFR, 2 GPUs, near-identical timing) never produces enough completion-time variance to trigger reordering. Also check why the Grafana panel showed balanced GPU load during real incidents.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "grep -A3 'gpu_utilization' monitoring/prometheus.yml"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "- record: gpu_utilization\n  expr: avg_over_time(gpu_busy[5m])\n  # 5-minute rolling average -- smooths out short thermal-throttle bursts of a few seconds, which is exactly the timescale a straggler event would occur on."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "FAILED EXPERIMENT: try to reproduce with a uniform artificial delay on one worker, as a quick test of the straggler theory.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/straggler_harness.py --fixed-delay-worker=3 --delay=0.5s --runs=20"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "20/20 runs: no reorder detected. A constant uniform delay keeps worker 3 in the same relative rank every run, so the reassembly happens to still be in-order. This does not match production's bursty, variable throttling pattern."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Build a more faithful reproducer using a delay profile sampled from real thermal-throttle telemetry instead of a fixed sleep.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/straggler_harness.py --delay-profile=logs/thermal_throttle_sample.csv --n-workers=8 --runs=50"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "6/50 runs: reorder detected in the reassembled segment list (adjacent segments swapped). Matches the ~1-in-40 production rate within noise. CONFIDENCE: high for reassembly-by-arrival as a real, reproducible defect."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Separately check the video-side timestamp assumption, since the ticket also notes drift WORSENS over the file length even without any single reorder event -- that pattern doesn't fit a one-time swap.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "video_pipeline/timestamp_map.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "def audio_offset_for_frame(frame_index, fps):\n    return frame_index / fps  # assumes constant frame duration\n# Does not read per-frame PTS from the source container; fps is a single nominal value passed in from job config."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "CAUSAL SUMMARY. SYMPTOM: audio/video drift, initially resembling an FFmpeg mux/timestamp bug (the 'Non-monotonous DTS' warning). TRIGGER: (a) GPU completion-time variance under load (thermal throttling) on the 8-GPU cluster, invisible on the 2-GPU dev box; (b) VFR source content. PRIMARY ROOT CAUSE: reassemble.py orders segments by completion_timestamp instead of sequence_id, so a straggler GPU can cause an out-of-order splice. SECONDARY ROOT CAUSE: timestamp_map.py assumes constant frame duration (frame_index/fps) instead of reading actual per-frame PTS from the VFR source, causing a slow cumulative drift independent of any single reorder. CONTRIBUTING FACTOR: the 5-minute Prometheus averaging window hides the short bursts that actually cause reordering. DOWNSTREAM CONSEQUENCE: FFmpeg's DTS warning is a symptom of the already-malformed audio input, not the cause. RULED OUT: the mux command itself (isolated test was clean). PATCH PLAN: (1) order reassembly by sequence_id, (2) map audio placement from real per-frame PTS instead of assumed CFR."
+      },
+      {
+        "role": "assistant",
+        "content": "PATCH 1: sort by sequence_id, and add a completion barrier so reassembly only runs once every dispatched segment for the batch has reported in -- guarantees full-batch presence before ordering.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "audio_pipeline/reassemble.py",
+            "old_string": "def reassemble(results):\n    results.sort(key=lambda r: r.completion_timestamp)\n    return concat_audio([r.audio for r in results])",
+            "new_string": "def reassemble(results, total_segments):\n    wait_for_all(results, total_segments)\n    results.sort(key=lambda r: r.sequence_id)\n    return concat_audio([r.audio for r in results[:-1]])  # trailing partial-batch guard"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to audio_pipeline/reassemble.py (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Verify correctness and throughput before going further.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/straggler_harness.py --delay-profile=logs/thermal_throttle_sample.csv --n-workers=8 --runs=50 && python pipeline/throughput_bench.py --minutes=60"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "straggler_harness: 0/50 reorders -- ordering fixed.\nthroughput_bench: 60-minute video took 41m12s on an 8-GPU node (SLA: <10m) -- REGRESSION.\nQA smoke report (3 sample titles): last audio segment of each title is truncated at the chapter boundary -- SECOND REGRESSION (functional, not just perf)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Two problems from patch 1: the completion barrier serializes the otherwise-async GPU pipeline (kills throughput), and results[:-1] in the concat drops the final segment (off-by-one from the barrier rewrite). Diagnose the off-by-one directly.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "audio_pipeline/reassemble.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "Confirms: `results[:-1]` was left over from an earlier draft meant to exclude an in-flight sentinel entry that no longer exists after adding wait_for_all(); it now discards the genuinely last real segment."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "RECOVERY: drop the blocking barrier entirely. Pre-allocate a fixed-size buffer sized by the known total segment count and let each async worker write directly into buffer[sequence_id] as it completes -- this gets correct ordering without serializing the pipeline, and removes the off-by-one since indexing is explicit rather than positional.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "audio_pipeline/reassemble.py",
+            "old_string": "def reassemble(results, total_segments):\n    wait_for_all(results, total_segments)\n    results.sort(key=lambda r: r.sequence_id)\n    return concat_audio([r.audio for r in results[:-1]])  # trailing partial-batch guard",
+            "new_string": "def reassemble(results, total_segments):\n    buffer = [None] * total_segments\n    for r in results:\n        buffer[r.sequence_id] = r.audio\n    assert all(x is not None for x in buffer), 'missing segment(s) in reassembly'\n    return concat_audio(buffer)"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to audio_pipeline/reassemble.py (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Now fix the secondary root cause: map audio placement from real per-frame PTS instead of the constant-frame-rate assumption.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "video_pipeline/timestamp_map.py",
+            "old_string": "def audio_offset_for_frame(frame_index, fps):\n    return frame_index / fps  # assumes constant frame duration",
+            "new_string": "def audio_offset_for_frame(frame_index, source_pts_table):\n    return source_pts_table[frame_index]  # read actual per-frame PTS from the demuxed VFR source"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to video_pipeline/timestamp_map.py (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Add a regression test combining a VFR fixture with an 8-worker straggler delay profile, matching the real reproduction conditions rather than the too-easy CFR/2-GPU fixture.",
+        "tool_call": {
+          "name": "write_file",
+          "arguments": {
+            "filepath": "tests/regression/test_vfr_straggler_sync.py",
+            "content": "Loads a VFR broadcast-capture fixture and the sampled thermal-throttle delay profile across 8 simulated GPU workers; asserts reassembled segment sequence_ids are strictly monotonic with no gaps, and that final audio duration matches video duration within one frame, across 20 repeated runs."
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "write_file",
+          "output": "Created tests/regression/test_vfr_straggler_sync.py (58 lines)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "VERIFICATION GATE: reorder repro, throughput SLA, full existing suite, and manifest schema compatibility.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/straggler_harness.py --delay-profile=logs/thermal_throttle_sample.csv --n-workers=8 --runs=50 && python pipeline/throughput_bench.py --minutes=60 && pytest tests/ -v && python tools/validate_manifest_schema.py --version v3"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "straggler_harness: 0/50 reorders.\nthroughput_bench: 60-minute video in 8m51s on 8-GPU node (within <10m SLA).\npytest: 31 passed (including previously-passing test_sync_2gpu_cfr, still passing, and the new test_vfr_straggler_sync across 20 internal repeats).\nvalidate_manifest_schema: segment_id format and field set unchanged, schema-v3 compatible."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Confirm patch surface.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "git diff --stat"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": " audio_pipeline/reassemble.py                       | 9 +++++----\n video_pipeline/timestamp_map.py                    | 3 ++-\n tests/regression/test_vfr_straggler_sync.py        | 58 +++++++++++++++++++\n 3 files changed, 65 insertions(+), 5 deletions(-)"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "All gates pass: the causal chain (arrival-order reassembly under GPU straggler variance, plus a separate CFR-assumption drift on VFR sources) is evidenced end to end; the FFmpeg mux hypothesis was directly eliminated with an isolated clean-input test; the barrier-induced throughput collapse and off-by-one truncation from patch 1 were both diagnosed and resolved without reintroducing the reorder bug; throughput, correctness, and manifest schema compatibility all hold; patch surface is minimal. Submitting.",
+        "tool_call": {
+          "name": "submit_patch",
+          "arguments": {}
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "submit_patch",
+          "output": "Patch submitted. 3 files changed. All gate checks recorded as passed."
+        }
+      }
+    ],
+    "evaluation": {
+      "diagnostic_accuracy": "Correctly separated two independently-real defects (arrival-order reassembly and CFR-assumption drift) rather than treating the FFmpeg warning as the root cause, and correctly identified it as a downstream symptom.",
+      "hypothesis_management": "Tested the FFmpeg-mux hypothesis with an isolated clean-input experiment and eliminated it with direct evidence before pivoting, rather than patching the mux layer speculatively.",
+      "evidence_usage": "Recognized that a 5-minute Prometheus averaging window could hide a second-scale straggler event, and did not treat 'balanced average GPU load' as proof of balanced instantaneous load.",
+      "tool_efficiency": "Abandoned the fixed-delay reproduction attempt quickly once it failed to match production's variable pattern, rather than repeating it with minor tweaks.",
+      "patch_quality": "Final patch replaces arrival-order sort and blocking wait with direct sequence-indexed buffer writes, avoiding both the original bug and the barrier-based patch's side effects, with minimal surface area.",
+      "regression_handling": "Identified two distinct regressions from patch 1 (throughput collapse from the barrier, off-by-one truncation from leftover slicing logic) and resolved both without reintroducing the original reorder defect.",
+      "performance_awareness": "Explicitly benchmarked the 60-minute/10-minute throughput SLA before and after each patch iteration, and chose a non-blocking design specifically to preserve async dispatch.",
+      "compatibility_awareness": "Validated the downstream segment manifest schema against the v3 contract before submission.",
+      "verification_quality": "Combined a straggler-profile stress reproduction, a throughput benchmark, the full test suite, and schema validation before submitting.",
+      "recovery_capability": "Diagnosed the off-by-one via direct code re-inspection rather than trial-and-error edits, and chose a structurally different (non-barrier) fix once the barrier approach was shown to conflict with the performance constraint.",
+      "overall_research_difficulty": "High: the most visible evidence (the FFmpeg DTS warning, the averaged GPU metric) actively points away from the real cause, and the two root causes require separate lines of investigation that only jointly explain the full symptom pattern."
+    },
+    "id": "dub-002"
+  },
+  {
+    "title": "Intermittent Double-Debit Under Peak Load Despite Idempotency Keys",
+    "domain": "Fintech Distributed Ledger / High-Concurrency Transaction Service",
+    "difficulty": "research-grade-adversarial",
+    "incident": "Under peak load, customer transfers are occasionally debited twice from the source account despite every request carrying a client-generated idempotency key. Support's working theory is an overly aggressive mobile SDK retry policy, reinforced by a retry-count metric that spikes in the same window as each incident.",
+    "constraints": [
+      "Throughput SLA: 1000 transfers/sec sustained with p99 commit latency under 150ms",
+      "No global lock across all accounts -- locking must remain per-account granularity",
+      "Documented idempotency contract: a replayed request with the same key must return the original result, not an error",
+      "Cannot fix by simply increasing the lock TTL, which only narrows the failure window without closing it"
+    ],
+    "success_criteria": [
+      "For any idempotency key, exactly one debit is ever committed to the ledger under concurrent stress",
+      "A legitimate retry with an already-used key returns the original cached result, not an error",
+      "A lock that nominally expires mid-transaction cannot result in an accepted stale write",
+      "Ledger balance conservation (sum of debits equals sum of credits) holds after stress testing",
+      "Sustained throughput and p99 latency SLA are met; existing test suite continues to pass"
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an autonomous SWE agent on the 'ledger-svc' repository (high-concurrency funds-transfer service: Postgres, Redis-based distributed locking, an idempotency layer, a connection pool). Tools: read_file, edit_file, write_file, run_command, submit_patch. Investigate the incident, establish root cause with evidence, patch minimally while preserving transactional correctness, and verify before calling submit_patch()."
+      },
+      {
+        "role": "user",
+        "content": "INC-7710: under peak load we've had 9 confirmed cases this quarter of a customer transfer being debited twice from the source account, despite every transfer request carrying a client-generated idempotency key. Support's working theory is that the mobile SDK is retrying too aggressively. Throughput SLA: 1000 transfers/sec sustained with p99 commit latency under 150ms. Cannot take a single global lock across all accounts (would collapse throughput). The transfer API's idempotency contract (retry with same key returns the original result) is documented and used by existing SDK clients -- it must not change. Investigate and fix."
+      },
+      {
+        "role": "assistant",
+        "content": "OBSERVATION: start with the incident record and correlated telemetry before forming a hypothesis.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "incidents/INC-7710.md"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "INC-7710.md: 9 double-debit cases, all during peak load windows (>500 transfers/sec sustained for 2+ min). Attached Grafana panel: client-side retry_count spikes sharply in the same 30-60s window as each incident."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS 1 (plausible, matches support's theory): the mobile SDK retries aggressively, generating a genuinely new idempotency key on retry rather than reusing the original. Check the SDK retry logic.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "sdk/mobile/transfer_client.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "def transfer(self, amount, dest):\n    key = self.idempotency_key  # generated once per logical transfer, cached on the request object and reused across retries\n    for attempt in range(3):\n        try:\n            return self._post('/transfer', json={'amount': amount, 'dest': dest, 'idempotency_key': key})\n        except Timeout:\n            continue\n# Key is generated ONCE and reused across all retry attempts -- retries alone should not produce two distinct keys."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "EVIDENCE/CONFLICT: retries reuse the same key, so a retry storm alone shouldn't cause a double debit if the server's idempotency check works correctly. The retry_count spike correlating with incidents may be a symptom of the same root cause (e.g. slow commits under load causing client timeouts) rather than the cause itself. NEXT ACTION: inspect the server-side idempotency check.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "ledger/transfer_service.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "def handle_transfer(req):\n    existing = redis.get(f'idem:{req.idempotency_key}')\n    if existing: return json.loads(existing)\n    result = _do_transfer(req)\n    redis.set(f'idem:{req.idempotency_key}', json.dumps(result), ex=3600)\n    return result\n# Classic check-then-insert: the Redis GET and the later SET are two separate round-trips, not atomic."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS 2: under concurrent duplicate requests (same key, arriving close together -- exactly what a client timeout-then-retry produces), two requests can both pass the GET-not-found check before either SET completes, both proceeding to _do_transfer. Confirm this is currently untested for concurrency.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "pytest tests/test_idempotency.py -v"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "tests/test_idempotency.py::test_same_key_returns_cached_result PASSED (sequential: calls handle_transfer twice in a row on the same thread, second call correctly returns cached result)"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Passes only because it's sequential -- the second call always arrives after the first SET completes. This doesn't exercise the race. FAILED EXPERIMENT: try to reproduce with repeated sequential duplicate-key calls first, since that's the cheapest test.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/duplicate_key_harness.py --mode=sequential --calls=500"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "500/500 sequential calls: 0 double-debits. Confirms sequential duplicate calls are not sufficient; the defect requires genuine concurrency."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Build a concurrent reproducer: many requests with the same idempotency key fired at once against a small connection pool, closer to a real timeout-then-retry burst under load.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/duplicate_key_harness.py --mode=concurrent --n=50 --pool-size=10"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "3/20 trials: double-debit reproduced. Confirms the check-then-insert race is real under concurrency, though inconsistent -- timing-dependent, matching production's intermittency."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS 3 (second, separate mechanism): check whether the per-account balance update lock could also allow interleaved writes independent of the idempotency race. Inspect the locking code.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "ledger/account_lock.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "def with_account_lock(account_id, fn):\n    lock = redlock.acquire(f'acct:{account_id}', ttl_ms=200)\n    try: return fn()\n    finally: redlock.release(lock)\n# Fixed 200ms TTL, no renewal/heartbeat during fn()."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Check the actual commit-duration distribution under load against that fixed 200ms TTL.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "grep -A2 'txn_commit_duration' monitoring/dashboards/ledger.json"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "txn_commit_duration p50=45ms p95=180ms p99=310ms under peak-load benchmark -- p99 EXCEEDS the 200ms lock TTL. A transaction in its p99 tail can have its lock silently expire while `fn()` is still executing."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Also check connection pool sizing during incident windows, since pool exhaustion would explain both the slow commits (queueing for a connection) and the retry-count spike (client timeouts while queued).",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "grep -A3 'pool_size\\|pool_timeout' config/db.yaml"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "db.yaml: pool_size: 20, pool_timeout: 5s. Incident-window connection-wait metrics show pool utilization at 98-100% for the full duration of 7 of the 9 incidents -- connections queueing, extending commit duration further."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "One more pathway to rule in or out: a partial failure where the DB commit inside _do_transfer succeeds but the subsequent Redis cache write fails or times out -- under the current check-then-insert code, a later retry would see a cache miss and re-execute the transfer even without any concurrency involved. Check error handling around the cache write.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "grep -n -B2 -A2 'redis.set' ledger/transfer_service.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "    result = _do_transfer(req)\n    redis.set(f'idem:{req.idempotency_key}', json.dumps(result), ex=3600)  # no try/except -- if this raises (Redis timeout, network blip), the exception propagates after the DB commit has already succeeded, and no cache entry exists for the next lookup."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "CONFIRMS a third, independent pathway to the same symptom: a partial failure between DB commit and cache population, unrelated to request concurrency. This doesn't require a race at all -- a single retried request after a cache-write failure would reprocess under the current code. PATCH PLAN update: the atomic-insert fix (Postgres unique constraint on idempotency_keys, DB as source of truth) closes this pathway too, since the constraint check no longer depends on Redis being populated -- Redis becomes a fast-path cache only, not the correctness mechanism."
+      },
+      {
+        "role": "assistant",
+        "content": "CAUSAL SUMMARY. SYMPTOM: same customer debited twice despite an idempotency key, initially resembling an aggressive-retry SDK bug. TRIGGER: peak load pushing connection pool utilization to ~100%. CASCADING CHAIN: pool exhaustion (A) -> commit duration spikes into the 200-310ms range (B) -> exceeds the fixed 200ms lock TTL (C) -> a second worker can acquire the 'expired' per-account lock while the first is still mid-commit (D) -> production failure: interleaved/duplicated writes. PRIMARY ROOT CAUSE: check-then-insert idempotency logic (Redis GET then later SET, not atomic) lets two concurrent requests with the same key both pass the not-found check. SECONDARY ROOT CAUSE: fixed-TTL account lock with no renewal can expire mid-transaction under load, independently allowing a lost-update/interleaved write even if the idempotency race were fixed alone. CONTRIBUTING FACTOR: connection pool sizing is too small for peak concurrency, which is what pushes commit duration past the lock TTL in the first place. RULED OUT: SDK retry key reuse (keys are reused correctly on retry) and sequential duplicate calls as a sufficient reproduction. PATCH PLAN: (1) make the idempotency check atomic, (2) replace the fixed-TTL lock with a fencing-token scheme so a late write from an 'expired' lock holder is rejected at commit time rather than relying on the TTL alone."
+      },
+      {
+        "role": "assistant",
+        "content": "PATCH 1: make idempotency insertion atomic with a unique DB constraint and INSERT ... ON CONFLICT, closing the check-then-insert race.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "ledger/transfer_service.py",
+            "old_string": "def handle_transfer(req):\n    existing = redis.get(f'idem:{req.idempotency_key}')\n    if existing: return json.loads(existing)\n    result = _do_transfer(req)\n    redis.set(f'idem:{req.idempotency_key}', json.dumps(result), ex=3600)\n    return result",
+            "new_string": "def handle_transfer(req):\n    try:\n        db.execute('INSERT INTO idempotency_keys (key) VALUES (%s)', [req.idempotency_key])\n    except UniqueViolation:\n        raise DuplicateRequest(req.idempotency_key)\n    result = _do_transfer(req)\n    redis.set(f'idem:{req.idempotency_key}', json.dumps(result), ex=3600)\n    return result"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to ledger/transfer_service.py (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Verify the concurrency race is closed and check client-facing behavior on retry.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/duplicate_key_harness.py --mode=concurrent --n=50 --pool-size=10 --trials=20 && pytest tests/test_sdk_contract.py -v"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "duplicate_key_harness: 0/20 trials double-debited -- race closed.\ntests/test_sdk_contract.py::test_retry_returns_original_result FAILED: server now returns HTTP 409 DuplicateRequest on a legitimate client retry with the same key, instead of the original cached transfer result. REGRESSION: breaks the documented idempotency contract."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "The atomic-insert approach correctly blocks the race but changes behavior for the common, legitimate case: a retried request with a key that's already committed should return the ORIGINAL result, not an error. Check the documented contract to confirm expected behavior before patching further.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "docs/api/idempotency_contract.md"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "'A request replayed with a previously used idempotency_key MUST return the original response body and status code, not an error, regardless of server-side timing.' -- confirms PATCH 1 as applied violates the documented contract for the legitimate-retry case."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "RECOVERY: on a unique-constraint conflict, look up and return the already-stored result instead of raising, restoring the documented replay contract while keeping the race closed.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "ledger/transfer_service.py",
+            "old_string": "    try:\n        db.execute('INSERT INTO idempotency_keys (key) VALUES (%s)', [req.idempotency_key])\n    except UniqueViolation:\n        raise DuplicateRequest(req.idempotency_key)",
+            "new_string": "    try:\n        db.execute('INSERT INTO idempotency_keys (key) VALUES (%s)', [req.idempotency_key])\n    except UniqueViolation:\n        cached = redis.get(f'idem:{req.idempotency_key}')\n        if cached:\n            return json.loads(cached)\n        return _await_in_flight_result(req.idempotency_key)  # concurrent request still committing; wait for it"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to ledger/transfer_service.py (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Now address the secondary root cause: replace the fixed-TTL lock with a fencing-token scheme, rather than simply increasing the TTL (which would only hide the problem under slightly higher load and increase worst-case lock hold time).",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "ledger/account_lock.py",
+            "old_string": "def with_account_lock(account_id, fn):\n    lock = redlock.acquire(f'acct:{account_id}', ttl_ms=200)\n    try: return fn()\n    finally: redlock.release(lock)",
+            "new_string": "def with_account_lock(account_id, fn):\n    lock = redlock.acquire(f'acct:{account_id}', ttl_ms=200)\n    token = lock.fencing_token\n    try:\n        return fn(fencing_token=token)\n    finally:\n        redlock.release(lock)"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to ledger/account_lock.py (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Enforce the fencing token at the actual commit point, so even if a lock nominally expired mid-transaction, a stale token's write is rejected rather than silently applied.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "ledger/transfer_service.py",
+            "old_string": "def _do_transfer(req):",
+            "new_string": "def _do_transfer(req, fencing_token=None):\n    if fencing_token is not None:\n        assert_fencing_token_current(req.account_id, fencing_token)  # raises if a newer token has since been issued"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to ledger/transfer_service.py (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Add a regression test covering both mechanisms together: concurrent same-key requests under a saturated connection pool, plus a simulated lock-expiry-during-commit interleaving.",
+        "tool_call": {
+          "name": "write_file",
+          "arguments": {
+            "filepath": "tests/regression/test_concurrent_idempotency_and_lock.py",
+            "content": "Spawns 200 concurrent transfer requests, a subset sharing the same idempotency_key, against a pool sized to force queueing; separately forces one transaction's commit to exceed the lock TTL and asserts the fencing token causes the stale writer's commit to be rejected. Asserts: exactly one debit per idempotency_key; ledger balance conservation (sum of debits == sum of credits) holds after all requests settle."
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "write_file",
+          "output": "Created tests/regression/test_concurrent_idempotency_and_lock.py (74 lines)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "VERIFICATION GATE: concurrency stress at production-like scale, throughput/latency SLA, full existing suite, and the SDK contract test that regressed under patch 1.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/duplicate_key_harness.py --mode=concurrent --n=200 --pool-size=10 --trials=50 && python bench/throughput_bench.py --target-tps=1000 --duration=120s && pytest tests/ -v"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "duplicate_key_harness: 0/50 trials double-debited.\nthroughput_bench: sustained 1024 tps, p99 commit latency 138ms (within 150ms SLA).\npytest: 88 passed, including test_sdk_contract.test_retry_returns_original_result (now passing again) and the new test_concurrent_idempotency_and_lock, run 30 times with no failures; ledger balance conservation invariant held in every run."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Confirm patch surface.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "git diff --stat"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": " ledger/transfer_service.py                                | 14 +++++++++-----\n ledger/account_lock.py                                     | 3 ++-\n tests/regression/test_concurrent_idempotency_and_lock.py  | 74 +++++++++++++++++++++\n 3 files changed, 89 insertions(+), 6 deletions(-)"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "All gates pass: the causal chain (pool exhaustion -> commit-duration spike -> lock-TTL expiry, combined with a separate check-then-insert idempotency race) is evidenced end to end; the SDK-retry hypothesis was eliminated with direct code inspection and a sequential-reproduction negative result; the idempotency-contract regression introduced by patch 1 was caught by the existing SDK contract test and fixed by replaying the original result on conflict instead of erroring; the lock-expiry issue was fixed with fencing tokens rather than a blind TTL increase, preserving per-account (not global) locking granularity and the throughput SLA; ledger balance conservation holds under stress. Submitting.",
+        "tool_call": {
+          "name": "submit_patch",
+          "arguments": {}
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "submit_patch",
+          "output": "Patch submitted. 3 files changed. All gate checks recorded as passed."
+        }
+      }
+    ],
+    "evaluation": {
+      "diagnostic_accuracy": "Correctly identified two independently sufficient concurrency defects (a check-then-insert idempotency race and a fixed-TTL lock expiring under load) rather than attributing the incident to either the SDK or a single fix.",
+      "hypothesis_management": "Tested and eliminated the SDK-retry hypothesis with direct code inspection and a sequential-reproduction negative result before pursuing the server-side race, and correctly treated the retry-count metric spike as correlated rather than causal.",
+      "evidence_usage": "Cross-referenced commit-duration percentiles against the lock TTL and connection-pool utilization against incident windows to establish the pool-exhaustion-to-lock-expiry causal chain, rather than asserting it without measurement.",
+      "tool_efficiency": "Moved from a cheap sequential reproduction (informative negative result) to a targeted concurrent reproduction rather than starting with expensive stress testing.",
+      "patch_quality": "Final patch closes the idempotency race with a standard atomic-insert pattern and closes the lock-expiry defect with fencing tokens rather than a blunt timeout increase, preserving per-account lock granularity.",
+      "regression_handling": "Caught the idempotency-contract regression introduced by patch 1 via the existing SDK contract test, confirmed the documented expected behavior before patching, and fixed it without reopening the original race.",
+      "performance_awareness": "Verified sustained throughput and p99 commit latency against the stated SLA after the final patch, and explicitly avoided a global-lock or TTL-increase shortcut that would have hurt performance or only narrowed the race window.",
+      "compatibility_awareness": "Preserved the documented idempotency replay contract relied on by existing SDK clients, verified by the pre-existing contract test.",
+      "verification_quality": "Ran concurrency stress at increased scale, a throughput/latency benchmark, the full existing suite, and an explicit ledger balance conservation check across repeated runs.",
+      "recovery_capability": "Diagnosed the contract regression against the documented spec rather than guessing at intended behavior, and recovered with a targeted fix rather than reverting the correctness improvement.",
+      "overall_research_difficulty": "High: the two root causes are only jointly sufficient to explain full production behavior, the most prominent telemetry (retry-count spike) is a red herring, and the first correct-seeming fix for one defect silently breaks a separate, previously-passing behavioral contract."
+    },
+    "id": "ledger-003"
+  },
+  {
+    "title": "Intermittent Segfault and Silent Corruption in a nogil C Extension",
+    "domain": "CPython / C Extension / Compiler-Level Failure",
+    "difficulty": "research-grade-adversarial",
+    "incident": "Production data-pipeline workers occasionally segfault or produce a row with numerically garbage values, only under the release (-O3) build on production-scale, multi-threaded workloads, never in dev. The working theory is a compiler miscompile introduced by a recent -O3/toolchain upgrade.",
+    "constraints": [
+      "The nogil fast path must sustain several million rows/sec; it cannot be wrapped entirely in `with gil:`",
+      "The RowCache C struct's binary layout is depended on by a separately-compiled sibling extension (fastrows_ext2) built against a pinned header and must not change size without an explicit ABI version bump",
+      "Fix must not weaken or remove existing correctness assertions",
+      "Fix must be evidence-driven; reproduction requires production-scale data, real thread concurrency, and the rare non-native-endian fallback branch together"
+    ],
+    "success_criteria": [
+      "Zero segfaults, corrupted values, or fatal refcount errors across 200 stress-test runs under the release build",
+      "Refcount-balance invariant holds (no leak, no premature free) under a refcount-tracking debug build",
+      "Fast-path throughput on native-endian data remains within noise of the pre-patch baseline",
+      "RowCache struct binary layout is unchanged; fastrows_ext2 test suite passes unmodified against the pinned header",
+      "Existing test_row_cache.py and full existing suite continue to pass"
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an autonomous SWE agent on the 'fastrows' repository (a Cython-accelerated row-processing extension used in a data pipeline, with a native C struct-level cache and a nogil fast path). Tools: read_file, edit_file, write_file, run_command, submit_patch. Investigate the incident, establish root cause with evidence, patch minimally while preserving the ABI and the nogil fast path's performance, and verify before calling submit_patch()."
+      },
+      {
+        "role": "user",
+        "content": "INC-5502: production data-pipeline workers occasionally crash with a segfault, or emit a row with numerically garbage values in one column, when processing large datasets. Never happens in dev. Only happens in the release build (-O3); the debug build has never reproduced it. This started being noticed shortly after we upgraded the build toolchain and enabled -O3, so the working theory is a compiler miscompile. The nogil fast path exists because this code must sustain several million rows/sec; wrapping it entirely in `with gil:` is not an option. The RowCache C struct's layout is also depended on by a separately-compiled sibling extension (fastrows_ext2) built against a pinned header, so its binary layout cannot change size without an explicit version bump. Investigate and fix."
+      },
+      {
+        "role": "assistant",
+        "content": "OBSERVATION: start with the incident record and the crash artifact before forming a hypothesis.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "incidents/INC-5502.md"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "INC-5502.md: 5 crashes and 2 silent-corruption reports over 6 weeks, all on production-scale datasets (>=50M rows) with >=4 worker threads. Attached backtrace top frame: 'fastrows._core.__pyx_fuse_1__pyx_f_8fastrows_5_core_convert_batch (inlined, auto-vectorized loop, fastrows/_core.pyx:212)'."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS 1 (plausible, matches the working theory): the crash frame points into an auto-vectorized, inlined numeric loop that only exists under -O3 -- a miscompile of the SIMD-optimized arithmetic. Inspect that loop.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "fastrows/_core.pyx",
+            "start_line": 195,
+            "end_line": 225
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "195: cdef void convert_batch(double* out, const uint8_t* raw, Py_ssize_t n) nogil:\n196:     cdef Py_ssize_t i\n197:     for i in range(n):\n198:         out[i] = <double>(<int64_t*>raw)[i] * SCALE\n...\n212:     # fallback for non-native-endian input handled separately, see convert_batch_fallback()\nNothing here looks structurally unsound for -O3 vectorization; it's a straightforward strided numeric loop."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Before assuming a compiler bug (a very high bar to clear), check whether the toolchain upgrade and the -O3 change coincided with anything else operationally, like dataset scale.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "git log --oneline -- CMakeLists.txt setup.py | head -5 && git log --oneline --since='3 months ago' -- infra/pipeline_scale.md"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "CMakeLists.txt: single commit 'enable -O3, upgrade to gcc-13' 7 weeks ago.\ninfra/pipeline_scale.md: commit 'increase default worker threads 2 -> 4, raise max dataset size 10M -> 80M rows' 8 weeks ago -- ONE WEEK BEFORE the compiler change. CONFOUND: both changes landed close together; -O3 alone is not the only variable that changed."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "CONFIDENCE lowered on 'pure compiler bug': the same window also introduced 2x more worker threads and 8x larger datasets, both of which are exactly the conditions under which a concurrency or memory-lifetime bug would appear for the first time regardless of the compiler. Check whether the existing test suite already covers this path under -O3.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "pytest tests/test_row_cache.py -v"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "tests/test_row_cache.py: 14 passed (release build, -O3). Fixture: 50k rows, single-threaded, native-endian data."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Passes reliably under -O3 with small, single-threaded, native-endian data -- doesn't rule out a bug that only needs production-scale data, concurrency, or the non-native-endian fallback path to manifest. HYPOTHESIS 2: inspect the row-level object cache for a reference-counting defect, a classic source of intermittent, scale- and timing-dependent corruption in C extensions.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "fastrows/row_cache.c"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "typedef struct { PyObject* cached_key; double* values; size_t n; } RowCache;\nvoid row_cache_store(RowCache* rc, PyObject* key, double* values, size_t n) {\n    rc->cached_key = key;  // no Py_INCREF -- stores a borrowed reference\n    rc->values = values; rc->n = n;\n}\nPyObject* row_cache_get_key(RowCache* rc) { return rc->cached_key; }"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "EVIDENCE: row_cache_store stores the PyObject* without incrementing its refcount. If the caller's only reference to `key` is a temporary (e.g. a tuple element that goes out of scope right after the call), CPython can free the object while row_cache still points to it -- a dangling pointer. At small scale, freed memory may not be reused quickly enough to surface as visible corruption; at production scale with heavier allocation churn, the freed chunk is more likely to be reused promptly by an unrelated object, producing exactly a 'garbage value in one column' or a segfault on dereference. NEXT ACTION: confirm with a memory tool before assuming this is sufficient on its own.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "valgrind --tool=memcheck python -m pytest tests/test_row_cache.py -v 2>&1 | tail -15"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "==12841== HEAP SUMMARY:\n==12841==   All heap blocks were freed -- no leaks are possible\n==12841== ERROR SUMMARY: 0 errors from 0 contexts\ntests/test_row_cache.py: 14 passed."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "FAILED EXPERIMENT: a clean Valgrind run under the small, single-threaded fixture does not disprove the hypothesis. Valgrind's instrumentation overhead substantially slows execution, which -- like TSan in similar cases -- tends to widen the gap between a use-after-free and any reuse of that memory, masking exactly this class of timing-dependent bug rather than exposing it. It's also not exercising the scale or thread count where the incidents occurred. NEXT ACTION: separately check the nogil fast path for anything that could interact with reference counting under real concurrency.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "fastrows/_core.pyx",
+            "start_line": 226,
+            "end_line": 250
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "226: cdef void convert_batch_fallback(RowCache* rc, PyObject* raw_obj, Py_ssize_t n) nogil:\n227:     # only used for non-native-endian input; rare in practice\n228:     with gil:\n229:         pass  # placeholder -- actual call below is OUTSIDE this block\n230:     result = slow_convert.byteswap_and_scale(raw_obj)  # calls back into Python-level code\n231:     row_cache_store(rc, <PyObject*>result, NULL, n)\n# Line 230 calls into Python-level code (refcount ops, allocations) from inside a `nogil` function, OUTSIDE the `with gil:` block on line 228 -- the gil block is a no-op placeholder that doesn't actually wrap the real call."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "SECOND, INDEPENDENT DEFECT confirmed: convert_batch_fallback claims nogil but calls back into Python-level code (refcounting, allocation) without actually holding the GIL for that call -- a GIL-safety violation. This is only reached by the non-native-endian fallback branch, which explains why small native-endian dev fixtures never hit it. Check the Python-level function it calls, since that module has no idea it might be invoked without the GIL.",
+        "tool_call": {
+          "name": "read_file",
+          "arguments": {
+            "filepath": "fastrows/slow_convert.py"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "read_file",
+          "output": "def byteswap_and_scale(raw_obj):\n    arr = raw_obj.byteswap()  # allocates a new numpy array, normal refcounted Python operations\n    return arr * SCALE\n# Ordinary Python-level code with no awareness of being called from a nogil context; assumes the GIL is held, as it normally would be."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "HYPOTHESIS CONVERGES on two interacting causes rather than one: (1) row_cache_store's missing Py_INCREF, and (2) convert_batch_fallback's GIL-unsafe callback into slow_convert.py. Either alone would be rare in dev-scale, single-threaded, native-endian conditions; together, at production scale with 4+ threads and occasional non-native-endian columns, they plausibly explain the observed segfaults and silent corruption. Build a minimal, faithful reproducer instead of continuing to speculate.",
+        "tool_call": {
+          "name": "write_file",
+          "arguments": {
+            "filepath": "repro/refcount_gil_repro.py",
+            "content": "Constructs a byte-swapped (non-native-endian) array to force the fallback branch, spawns 8 worker threads each processing batches through fastrows, and interleaves gc.collect() calls plus allocation of filler objects between batches to increase the chance of prompt memory reuse after a premature free."
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "write_file",
+          "output": "Created repro/refcount_gil_repro.py (41 lines)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Run the reproducer under the release build, matching production conditions.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/refcount_gil_repro.py --build=release --threads=8 --runs=20"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "Run 6/20: Segmentation fault (core dumped) after ~14.7s.\nRun 11/20: row contains value 6.02e+23 in a column that should be bounded [0, 1e6] -- silent corruption reproduced.\n6/20 total failures across 20 runs, matching the intermittent production rate within noise."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Confirmed reproducible. Also run the identical reproducer under the debug build to understand why it's never been seen there, since that gap is itself diagnostic.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/refcount_gil_repro.py --build=debug --threads=8 --runs=20"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "0/20 failures under the debug build. Debug build links Python's debug allocator (pymalloc in debug mode), which pads freed blocks with a poison pattern and delays their reuse rather than handing them back to the allocator immediately -- a stale pointer reads back poison bytes (often caught by an internal assertion) far more often than it silently reads a reused live object, unlike the release allocator's eager reuse."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "CAUSAL SUMMARY. SYMPTOM: intermittent segfaults and numerically garbage column values, initially resembling a compiler miscompile in an auto-vectorized loop. TRIGGER: production-scale data with 4+ worker threads and occasional non-native-endian columns; a confound (toolchain/-O3 upgrade landing in the same window as a scale increase) initially pointed at the compiler. CASCADING CHAIN: row_cache_store stores an unowned PyObject* (A) -> the underlying object's refcount can drop to zero and be freed while still cached (B) -> under production memory pressure the freed chunk is promptly reused by an unrelated object (C) -> the stale cached pointer is read back as if it were the original object (D) -> garbage values or a segfault on dereference. SEPARATE, INTERACTING ROOT CAUSE: convert_batch_fallback claims nogil but calls into Python-level code (slow_convert.py) without actually holding the GIL for that call, a GIL-safety violation only reached by the rare non-native-endian fallback branch and only consequential under real thread concurrency. CONTRIBUTING FACTOR: the debug build's poisoning allocator masks both defects by delaying reuse of freed memory; production's release allocator reuses it eagerly. DOWNSTREAM CONSEQUENCE: the crash backtrace's top frame (inside the inlined SIMD loop) is where the corrupted value happens to be consumed, not where it was corrupted. RULED OUT: a pure compiler/-O3 miscompile (the loop itself is structurally ordinary; a scale/thread-count confound landed in the same window); Valgrind was informative but non-disqualifying, not proof of absence. PATCH PLAN: (1) fix reference ownership in row_cache_store, (2) properly scope GIL reacquisition around the fallback's Python-level call, (3) preserve the RowCache struct's binary layout for fastrows_ext2 ABI compatibility."
+      },
+      {
+        "role": "assistant",
+        "content": "PATCH 1: own the reference in row_cache_store (Py_INCREF on store) and release the previous one correctly on overwrite.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "fastrows/row_cache.c",
+            "old_string": "void row_cache_store(RowCache* rc, PyObject* key, double* values, size_t n) {\n    rc->cached_key = key;  // no Py_INCREF -- stores a borrowed reference\n    rc->values = values; rc->n = n;\n}",
+            "new_string": "void row_cache_store(RowCache* rc, PyObject* key, double* values, size_t n) {\n    Py_XINCREF(key);\n    Py_XDECREF(rc->cached_key);\n    rc->cached_key = key;\n    rc->values = values; rc->n = n;\n}"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to fastrows/row_cache.c (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Rerun the reproducer to verify before touching the second defect.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/refcount_gil_repro.py --build=release --threads=8 --runs=20"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "0/20 segfaults or garbage-value corruptions of the original signature. HOWEVER 3/20 runs now hit: 'Fatal Python error: deallocating object with refcount already 0' -- a DIFFERENT crash signature, still concurrency-related. REGRESSION EXPOSED: fixing the dangling-pointer bug removed one source of corruption, which makes the previously-masked GIL-safety violation surface more cleanly, since two threads can now race directly on the same live object's refcount without the GIL serializing the increment/decrement."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "This is the second root cause identified earlier, now unmasked rather than newly created -- consistent with the hypothesis that both defects were interacting. Confirm by checking whether the new crash's thread IDs line up with the fallback branch.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/refcount_gil_repro.py --build=release --threads=8 --runs=5 --annotate-thread-ids 2>&1 | grep -A3 'Fatal Python error'"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "Fatal Python error: deallocating object with refcount already 0\nThread 0x7f2a1 (worker-3): last call convert_batch_fallback -> slow_convert.byteswap_and_scale\nThread 0x7f2a4 (worker-6): last call convert_batch_fallback -> slow_convert.byteswap_and_scale\nBoth threads were inside the fallback path at the moment of the crash -- confirms the GIL-safety violation as the mechanism."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "PATCH 2: scope GIL reacquisition narrowly around the fallback's Python-level call only, not the whole nogil function, to preserve the fast path's performance for the common (native-endian) case.",
+        "tool_call": {
+          "name": "edit_file",
+          "arguments": {
+            "filepath": "fastrows/_core.pyx",
+            "old_string": "228:     with gil:\n229:         pass  # placeholder -- actual call below is OUTSIDE this block\n230:     result = slow_convert.byteswap_and_scale(raw_obj)  # calls back into Python-level code",
+            "new_string": "228:     with gil:\n229:         result = slow_convert.byteswap_and_scale(raw_obj)  # now genuinely GIL-protected"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "edit_file",
+          "output": "Edit applied to fastrows/_core.pyx (1 replacement)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Verify correctness across many iterations, then check the fast-path throughput budget, since the GIL reacquisition must stay scoped to the rare fallback branch.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python repro/refcount_gil_repro.py --build=release --threads=8 --runs=200 && python bench/throughput_bench.py --rows=100000000"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "refcount_gil_repro: 0/200 failures (segfault, corruption, or fatal refcount error).\nthroughput_bench (native-endian fast path, no fallback branch hit): 6.1M rows/sec (baseline: 6.3M rows/sec, within noise) -- the GIL reacquisition only affects the rare non-native-endian fallback path, not the common case."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Check ABI: confirm the RowCache struct's binary layout is unchanged for fastrows_ext2, since Py_XINCREF/Py_XDECREF in row_cache_store don't add or resize fields.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "python tools/abi_check.py --struct=RowCache --pinned-header=include/fastrows_ext2_abi.h"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "RowCache: sizeof=24 bytes, field offsets {cached_key:0, values:8, n:16} -- IDENTICAL to the pinned header. No ABI version bump required. fastrows_ext2 test suite (built against the pinned header) passes unmodified."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Add a refcount-balance invariant check (using a debug refcount-tracking build) and a regression test capturing the exact reproduction conditions.",
+        "tool_call": {
+          "name": "write_file",
+          "arguments": {
+            "filepath": "tests/regression/test_refcount_gil_fallback.py",
+            "content": "Runs repro/refcount_gil_repro.py conditions (byte-swapped data, 8 threads, gc pressure) 50 times under both release and a refcount-tracking debug build (Py_DEBUG with sys.gettotalrefcount before/after); asserts zero crashes, zero corrupted values, and that total refcount returns to its pre-run baseline (no leak, no premature free) after each run."
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "write_file",
+          "output": "Created tests/regression/test_refcount_gil_fallback.py (66 lines)."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "VERIFICATION GATE: full existing suite, refcount-balance invariant under the tracking build, extended stress, throughput, and ABI check together.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "pytest tests/ -v && python -X importtime -c 'import fastrows' && pytest tests/regression/test_refcount_gil_fallback.py -v"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": "pytest tests/: 47 passed, including the previously-passing-despite-the-bug test_row_cache.py (still passes, now for the right reasons).\ntest_refcount_gil_fallback.py: 1 passed -- 50/50 runs clean under both release and refcount-tracking debug builds; refcount delta = 0 in every run."
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "Confirm patch surface.",
+        "tool_call": {
+          "name": "run_command",
+          "arguments": {
+            "command": "git diff --stat"
+          }
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "run_command",
+          "output": " fastrows/row_cache.c                                 | 4 +++-\n fastrows/_core.pyx                                    | 3 ++-\n tests/regression/test_refcount_gil_fallback.py       | 66 +++++++++++++++++++++\n repro/refcount_gil_repro.py                           | 41 +++++++++++++\n 4 files changed, 111 insertions(+), 3 deletions(-)"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "All gates pass: the causal chain (an unowned cached PyObject*, plus a nogil function that calls back into GIL-dependent Python code without actually reacquiring the GIL, jointly triggered only at production scale and thread count on the rare non-native-endian path) is evidenced end to end with a faithful minimal reproducer; the compiler-miscompile hypothesis was eliminated by inspecting the loop directly and identifying a scale/thread-count confound in the change history; a clean Valgrind run and a clean debug-build run were both correctly treated as non-disqualifying given their respective masking mechanisms (instrumentation overhead; poisoning allocator delaying reuse) rather than as proof of absence; the second crash signature exposed by patch 1 was recognized as the previously-masked second root cause rather than a new defect, confirmed via thread-ID correlation, and fixed by narrowly scoping GIL reacquisition to the rare fallback branch, preserving fast-path throughput; the RowCache struct's binary layout and fastrows_ext2 ABI compatibility are unchanged; a refcount-balance invariant holds across repeated runs. Submitting.",
+        "tool_call": {
+          "name": "submit_patch",
+          "arguments": {}
+        }
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_result": {
+          "name": "submit_patch",
+          "output": "Patch submitted. 4 files changed. All gate checks recorded as passed."
+        }
+      }
+    ],
+    "evaluation": {
+      "diagnostic_accuracy": "Correctly identified two independently necessary defects (an unowned cached PyObject* and a GIL-safety violation in a rarely-hit fallback branch) rather than accepting the more visible compiler-miscompile explanation.",
+      "hypothesis_management": "Actively looked for and found a confound (a concurrent scale/thread-count change) before accepting the compiler-bug hypothesis, and correctly reinterpreted the second crash signature after patch 1 as the previously-masked second cause rather than a fresh defect.",
+      "evidence_usage": "Correctly reasoned about why both a clean Valgrind run and a clean debug-build run were non-disqualifying (instrumentation overhead and a poisoning allocator each independently mask this class of bug) instead of treating either as proof of absence.",
+      "tool_efficiency": "Used a cheap small-scale test result to bound the problem before committing to building a more expensive, faithful multi-threaded reproducer.",
+      "patch_quality": "Final patch is a small refcount-ownership fix plus a narrowly-scoped GIL reacquisition around only the rare fallback call, with no broad rewrite of the nogil fast path.",
+      "regression_handling": "Recognized the new crash signature after patch 1 as an exposed pre-existing defect rather than a novel regression, confirmed the interpretation with thread-ID correlation before patching further.",
+      "performance_awareness": "Benchmarked the native-endian fast path after the GIL-scoping fix to confirm throughput stayed within noise of baseline, since a global `with gil` would have violated the stated performance constraint.",
+      "compatibility_awareness": "Explicitly verified the RowCache struct's size and field offsets against the pinned fastrows_ext2 header and ran that sibling extension's test suite unmodified.",
+      "verification_quality": "Combined the full existing suite, an extended 200-run stress reproduction, a refcount-tracking debug-build invariant check, a throughput benchmark, and an ABI layout check before submission.",
+      "recovery_capability": "Distinguished a genuinely new regression from an unmasked pre-existing defect using direct evidence (thread-ID correlation) rather than assumption, and patched the correct target as a result.",
+      "overall_research_difficulty": "Very high: the most prominent evidence (crash location, timing of a toolchain upgrade) points at a compiler bug; the real defect requires production scale, real concurrency, and a rare code path simultaneously, and two standard diagnostic tools (Valgrind, the debug build) both independently produce clean results for principled but different reasons."
+    },
+    "id": "fastrows-004"
+  }
+]

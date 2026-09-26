@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TrainingExample",
+  "type": "object",
+  "required": ["id", "category", "input", "output"],
+  "properties": {
+    "id": {"type": "string"},
+    "category": {
+      "type": "string",
+      "enum": [
+        "software_development", "frontend", "backend", "ui_ux",
+        "design_to_code", "debugging", "tool_use", "agent_workflow",
+        "self_correction", "code_review", "requirements", "architecture",
+        "preference"
+      ]
+    },
+    "input": {"type": "string"},
+    "output": {"type": "string"},
+    "preference_rejected_output": {
+      "type": "string",
+      "description": "Only present for DPO-style preference examples."
+    },
+    "metadata": {"type": "object"}
+  }
+}

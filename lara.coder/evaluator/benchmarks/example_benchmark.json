@@ -1,0 +1,13 @@
+{
+  "id": "clothing-shop-basic",
+  "prompt": "Build me a modern online shop for selling clothes.",
+  "expected_acceptance_criteria": [
+    "Product listing page with images, name, price",
+    "Product detail page",
+    "Cart with add/remove/quantity update",
+    "Checkout flow (can be mocked payment)",
+    "Responsive on mobile and desktop",
+    "No console errors on core flows",
+    "Images have alt text"
+  ]
+}

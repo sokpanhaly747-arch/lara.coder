@@ -1,0 +1,20 @@
+# Example SFT/LoRA config. Designed to run on a single consumer GPU
+# (e.g. 24GB) via QLoRA; adjust batch size / quantization for your hardware.
+base_model: "Qwen/Qwen2.5-Coder-7B-Instruct"   # swappable; see models/adapter.py
+method: qlora
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+quantization: "nf4"
+training:
+  epochs: 3
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  max_seq_length: 4096
+dataset:
+  path: "../dataset/examples"
+  categories: ["software_development", "frontend", "debugging", "tool_use"]
+output_dir: "./checkpoints/sft-run-1"
